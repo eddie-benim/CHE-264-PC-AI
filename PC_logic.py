@@ -33,10 +33,7 @@ class TrialAnalysisResult(BaseModel):
     suggested_pid: PIDTuningResult
     workflow: List[WorkflowItem]
 
-TIME_CANDS = [
-    "Elapsed Time",
-    "elapsed time",
-]
+TIME_CANDS = ["Elapsed Time", "elapsed time"]
 PV_CANDS = [
     "Hot Water Temperature T2 (°C)",
     "Hot Water Temperature T2 (deg C)",
@@ -70,16 +67,16 @@ def clean_export_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 def match_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = list(df.columns)
-    lower_map = {c: c.lower() for c in cols}
-    lower_cands = [c.lower() for c in candidates]
-    for lc in lower_cands:
+    lower_map = {c: c.lower() for c in df.columns}
+    for cand in candidates:
+        cl = cand.lower()
         for orig, low in lower_map.items():
-            if lc == low:
+            if cl == low:
                 return orig
-    for lc in lower_cands:
+    for cand in candidates:
+        cl = cand.lower()
         for orig, low in lower_map.items():
-            if lc in low:
+            if cl in low:
                 return orig
     return None
 
@@ -139,9 +136,7 @@ def estimate_fopdt_from_step(df: pd.DataFrame, time_col: str, pv_col: str, mv_co
     y = coerce_numeric(df[pv_col])
     u = coerce_numeric(df[mv_col])
     mask = ~np.isnan(t) & ~np.isnan(y) & ~np.isnan(u)
-    t = t[mask]
-    y = y[mask]
-    u = u[mask]
+    t = t[mask]; y = y[mask]; u = u[mask]
     if t.size < 10 or y.size < 10 or u.size < 10:
         return None
     du = np.diff(u)
@@ -173,10 +168,38 @@ def estimate_fopdt_from_step(df: pd.DataFrame, time_col: str, pv_col: str, mv_co
     K = delta_y / delta_u
     return {"K": float(K), "tau": float(tau), "theta": float(theta), "t_step": float(t_step)}
 
+def estimate_fopdt_from_pv_only(df: pd.DataFrame, time_col: str, pv_col: str) -> Optional[Dict[str, float]]:
+    t = coerce_numeric(df[time_col])
+    y = coerce_numeric(df[pv_col])
+    mask = ~np.isnan(t) & ~np.isnan(y)
+    t = t[mask]; y = y[mask]
+    if t.size < 10 or y.size < 10:
+        return None
+    y0 = float(y[0])
+    y_ss = float(np.nanmean(y[int(0.8 * y.size) :]))
+    delta_y = y_ss - y0
+    if abs(delta_y) < 1e-3:
+        return None
+    y28 = y0 + 0.283 * delta_y
+    y63 = y0 + 0.632 * delta_y
+    t0 = float(t[0])
+    t28_candidates = t[y >= y28]
+    t63_candidates = t[y >= y63]
+    if t28_candidates.size == 0 or t63_candidates.size == 0:
+        return None
+    t28 = float(t28_candidates[0])
+    t63 = float(t63_candidates[0])
+    theta = max(t28 - t0, 1e-3)
+    tau = max(t63 - t28, 1e-3)
+    K = delta_y  # assume unit input, so gain ~ delta_y
+    return {"K": float(K), "tau": float(tau), "theta": float(theta), "t_step": float(t0)}
+
 def ziegler_nichols_pid(fopdt: Dict[str, float]) -> PIDTuningResult:
     K = fopdt["K"]
     tau = fopdt["tau"]
     theta = fopdt["theta"]
+    if K == 0:
+        K = 1.0
     kp = 1.2 * tau / (K * theta)
     ti = 2.0 * theta
     td = 0.5 * theta
@@ -200,13 +223,13 @@ def conservative_from_zn(zn: PIDTuningResult, factor: float = 0.7) -> PIDTuningR
         notes="Dead time or property change detected, gains reduced",
     )
 
-def make_workflow_from_fopdt(trial_name: str, fluid: str, fopdt: Optional[Dict[str, float]], method: str, mode: str) -> List[WorkflowItem]:
+def make_workflow_from_fopdt(trial_name: str, fluid: str, fopdt: Optional[Dict[str, float]], method: str, mode: str, source: str) -> List[WorkflowItem]:
     items = []
     items.append(WorkflowItem(step="Trial identified", detail=f"Trial={trial_name}, fluid={fluid}, mode={mode}"))
     if fopdt:
-        items.append(WorkflowItem(step="FOPDT estimation", detail=f"K={fopdt['K']:.3f}, tau={fopdt['tau']:.2f}s, theta={fopdt['theta']:.2f}s"))
+        items.append(WorkflowItem(step=f"FOPDT estimation ({source})", detail=f"K={fopdt['K']:.3f}, tau={fopdt['tau']:.2f}s, theta={fopdt['theta']:.2f}s"))
     else:
-        items.append(WorkflowItem(step="FOPDT estimation", detail="FOPDT not reliably detected"))
+        items.append(WorkflowItem(step=f"FOPDT estimation ({source})", detail="FOPDT not reliably detected"))
     items.append(WorkflowItem(step="Tuning method", detail=method))
     items.append(WorkflowItem(step="Lab constraints", detail="Small-scale PCT with dead time and heat exchanger"))
     return items
@@ -233,8 +256,7 @@ def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     content = resp.choices[0].message.content.strip()
     if content.startswith("```"):
-        content = content.strip("`")
-        content = content.replace("json", "").strip()
+        content = content.strip("`").replace("json", "").strip()
     try:
         data = json.loads(content)
     except Exception:
@@ -286,6 +308,11 @@ def analyze_trial_excel(
     mv_col = select_mv_column(df, time_col, pv_col)
     fopdt = estimate_fopdt_from_step(df, time_col, pv_col, mv_col)
     normalized_mode = normalize_mode(mode)
+    if fopdt is None:
+        fopdt = estimate_fopdt_from_pv_only(df, time_col, pv_col)
+        source = "PV-only"
+    else:
+        source = "MV+PV"
     if normalized_mode == "day1":
         if fopdt:
             zn = ziegler_nichols_pid(fopdt)
@@ -293,15 +320,15 @@ def analyze_trial_excel(
                 tuned = conservative_from_zn(zn, factor=0.6)
             else:
                 tuned = zn
-            workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode)
+            workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode, source)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=tuned, workflow=workflow)
         else:
-            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected; ensure a real change in Heater Power PWR (kW) exists in the data")
-            workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, "Fallback", normalized_mode)
+            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="Could not infer dynamics from this dataset")
+            workflow = make_workflow_from_fopdt(trial_name, fluid, None, "Fallback", normalized_mode, source)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=default_pid, workflow=workflow)
     else:
         tuned = ml_tune_pid(trial_name, fluid, df, fopdt, prior_pid, objective)
-        workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode)
+        workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode, source)
         workflow.append(WorkflowItem(step="ML rationale", detail=tuned.notes))
         return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=tuned, workflow=workflow)
 
