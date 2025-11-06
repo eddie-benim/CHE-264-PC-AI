@@ -3,12 +3,12 @@ import os
 from datetime import datetime
 
 import streamlit as st
-
-from agents import set_default_openai_key
+from openai import OpenAI
 import PC_logic as pcl
 
 if "OPENAI_API_KEY" in st.secrets:
-    set_default_openai_key(st.secrets["OPENAI_API_KEY"])
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+client = OpenAI()
 
 st.set_page_config(page_title="Process Control PID Assistant", layout="wide")
 
