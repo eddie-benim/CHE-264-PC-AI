@@ -33,9 +33,28 @@ class TrialAnalysisResult(BaseModel):
     suggested_pid: PIDTuningResult
     workflow: List[WorkflowItem]
 
-TIME_KEYWORDS = ["elapsed", "sample time", "sample_time", "time", "sec"]
-PV_KEYWORDS = ["hot water temperature t2 (deg c)", "hot water temperature t2", "t2", "temperature", "pv", "process variable"]
-MV_KEYWORDS = ["heater", "control", "controller", "output", "mv", "pump", "valve"]
+TIME_CANDS = [
+    "Elapsed Time",
+    "elapsed time",
+]
+PV_CANDS = [
+    "Hot Water Temperature T2 (°C)",
+    "Hot Water Temperature T2 (deg C)",
+    "Hot Water Temperature T2",
+    "hot water temperature t2 (°c)",
+    "hot water temperature t2 (deg c)",
+]
+MV_CANDS_PRIMARY = [
+    "Heater Power PWR (kW)",
+    "Heater Power PWR",
+    "Heater Power",
+    "heater power pwr (kw)",
+]
+MV_CANDS_FALLBACK = [
+    "Heating Pump Speed N2 (%)",
+    "Heating Pump Speed N2",
+    "heating pump speed n2 (%)",
+]
 
 def read_excel_file(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
@@ -50,16 +69,22 @@ def clean_export_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     return df.reset_index(drop=True)
 
-def first_match_by_keywords(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
-    lower_map = {c: c.lower() for c in df.columns}
-    for kw in keywords:
+def match_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = list(df.columns)
+    lower_map = {c: c.lower() for c in cols}
+    lower_cands = [c.lower() for c in candidates]
+    for lc in lower_cands:
         for orig, low in lower_map.items():
-            if kw in low:
+            if lc == low:
+                return orig
+    for lc in lower_cands:
+        for orig, low in lower_map.items():
+            if lc in low:
                 return orig
     return None
 
 def select_time_column(df: pd.DataFrame) -> str:
-    m = first_match_by_keywords(df, TIME_KEYWORDS)
+    m = match_column(df, TIME_CANDS)
     if m:
         return m
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -67,60 +92,40 @@ def select_time_column(df: pd.DataFrame) -> str:
         return numeric_cols[0]
     return df.columns[0]
 
-def select_pv_column(df: pd.DataFrame, time_col: str) -> str:
-    lower_map = {c: c.lower() for c in df.columns}
-    for c, low in lower_map.items():
-        if "hot water temperature t2" in low:
-            return c
-    m = first_match_by_keywords(df, PV_KEYWORDS)
+def select_pv_column(df: pd.DataFrame) -> str:
+    m = match_column(df, PV_CANDS)
     if m:
         return m
-    numeric_cols = [c for c in df.columns if c != time_col and pd.api.types.is_numeric_dtype(df[c])]
-    if numeric_cols:
-        return numeric_cols[0]
-    others = [c for c in df.columns if c != time_col]
-    return others[0] if others else df.columns[0]
-
-def auto_mv_by_name(df: pd.DataFrame, exclude: List[str]) -> Optional[str]:
-    lower_map = {c: c.lower() for c in df.columns}
-    for kw in MV_KEYWORDS:
-        for orig, low in lower_map.items():
-            if orig in exclude:
-                continue
-            if kw in low:
-                return orig
-    return None
-
-def auto_mv_by_biggest_step(df: pd.DataFrame, exclude: List[str]) -> Optional[str]:
-    best_col = None
-    best_jump = 0.0
     for c in df.columns:
-        if c in exclude:
-            continue
-        if not pd.api.types.is_numeric_dtype(df[c]):
-            continue
-        v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
-        v = v[~np.isnan(v)]
-        if v.size < 3:
-            continue
-        du = np.diff(v)
-        if du.size == 0:
-            continue
-        jump = np.nanmax(np.abs(du))
-        if np.isfinite(jump) and jump > best_jump:
-            best_jump = float(jump)
-            best_col = c
-    return best_col
+        if "t2" in c.lower():
+            return c
+    return df.columns[0]
 
 def select_mv_column(df: pd.DataFrame, time_col: str, pv_col: str) -> str:
-    mv = auto_mv_by_name(df, exclude=[time_col, pv_col])
-    if mv:
-        return mv
-    mv = auto_mv_by_biggest_step(df, exclude=[time_col, pv_col])
-    if mv:
-        return mv
+    m = match_column(df, MV_CANDS_PRIMARY)
+    if m:
+        return m
+    m2 = match_column(df, MV_CANDS_FALLBACK)
+    if m2:
+        return m2
     numeric_cols = [c for c in df.columns if c not in (time_col, pv_col) and pd.api.types.is_numeric_dtype(df[c])]
     if numeric_cols:
+        best_col = None
+        best_jump = 0.0
+        for c in numeric_cols:
+            v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+            v = v[~np.isnan(v)]
+            if v.size < 3:
+                continue
+            du = np.diff(v)
+            if du.size == 0:
+                continue
+            jump = np.nanmax(np.abs(du))
+            if np.isfinite(jump) and jump > best_jump:
+                best_jump = float(jump)
+                best_col = c
+        if best_col is not None:
+            return best_col
         return numeric_cols[0]
     others = [c for c in df.columns if c not in (time_col, pv_col)]
     return others[0] if others else df.columns[0]
@@ -277,7 +282,7 @@ def analyze_trial_excel(
     df = read_excel_file(file_bytes)
     df = clean_export_df(df)
     time_col = select_time_column(df)
-    pv_col = select_pv_column(df, time_col)
+    pv_col = select_pv_column(df)
     mv_col = select_mv_column(df, time_col, pv_col)
     fopdt = estimate_fopdt_from_step(df, time_col, pv_col, mv_col)
     normalized_mode = normalize_mode(mode)
@@ -291,7 +296,7 @@ def analyze_trial_excel(
             workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=tuned, workflow=workflow)
         else:
-            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected; ensure the MV column has a clear step/change")
+            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected; ensure a real change in Heater Power PWR (kW) exists in the data")
             workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, "Fallback", normalized_mode)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=default_pid, workflow=workflow)
     else:
