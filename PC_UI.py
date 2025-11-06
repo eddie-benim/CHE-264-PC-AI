@@ -1,6 +1,8 @@
 import os
 from datetime import datetime
+from io import BytesIO
 
+import pandas as pd
 import streamlit as st
 import PC_logic as pcl
 
@@ -13,7 +15,6 @@ if "runs" not in st.session_state:
     st.session_state.runs = []
 
 st.title("Process Control PID Assistant")
-st.markdown("Upload a process-control Excel export, pick the tuning mode, and get PID parameters for your next trial.")
 
 ts = pcl.current_timestamp_meta()
 with st.sidebar:
@@ -46,7 +47,6 @@ with st.sidebar:
         prior_kp = prior_ti = prior_td = 0.0
 
 st.divider()
-
 st.subheader("Upload trial data")
 uploaded_file = st.file_uploader(
     "Drag and drop or browse to an Excel export (.xlsx, .xls)",
@@ -54,6 +54,27 @@ uploaded_file = st.file_uploader(
 )
 
 trial_name = st.text_input("Trial label", value="Current_Trial")
+
+time_col = None
+pv_col = None
+mv_col = None
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    bio = BytesIO(file_bytes)
+    try:
+        df_preview = pd.read_excel(bio)
+    except Exception:
+        bio.seek(0)
+        df_preview = pd.read_excel(bio, engine="xlrd")
+    cols = list(df_preview.columns)
+    st.markdown("**Detected columns from file:**")
+    st.code("\n".join(str(c) for c in cols), language="text")
+    time_col = st.selectbox("Select time column", cols, index=0)
+    pv_col = st.selectbox("Select PV (temperature/process variable) column", cols, index=min(1, len(cols)-1))
+    mv_col = st.selectbox("Select MV (controller/manipulated) column", cols, index=min(2, len(cols)-1))
+else:
+    df_preview = None
 
 run_btn = st.button("Generate PID", use_container_width=True)
 
@@ -74,6 +95,9 @@ if run_btn:
                 mode=mode_value,
                 prior_pid=prior_pid,
                 objective=objective,
+                time_col=time_col,
+                pv_col=pv_col,
+                mv_col=mv_col,
             )
         st.session_state.runs.append(result)
 
@@ -83,7 +107,7 @@ st.subheader("Results")
 if not st.session_state.runs:
     st.info("Run an analysis to see PID suggestions here.")
 else:
-    for idx, r in enumerate(reversed(st.session_state.runs), start=1):
+    for r in reversed(st.session_state.runs):
         with st.expander(f"{r.trial_name} – {r.fluid} – {r.mode.upper()}"):
             st.markdown("**Suggested PID**")
             st.markdown(f"- Kp: `{r.suggested_pid.kp:.4f}`")
@@ -95,10 +119,9 @@ else:
             for step in r.workflow:
                 st.markdown(f"- **{step.step}:** {step.detail}")
 
-    json_blob = pcl.serialize_results(st.session_state.runs)
     st.download_button(
         "Download all run results as JSON",
-        data=json_blob,
+        data=pcl.serialize_results(st.session_state.runs),
         file_name=f"pc_pid_runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json",
         use_container_width=True,
