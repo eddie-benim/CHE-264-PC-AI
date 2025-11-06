@@ -98,6 +98,22 @@ def select_pv_column(df: pd.DataFrame, time_col: str) -> str:
     other_cols = [c for c in df.columns if c != time_col]
     return other_cols[0]
 
+def auto_mv_by_biggest_step(df: pd.DataFrame, exclude: List[str]) -> Optional[str]:
+    numeric_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+    best_col = None
+    best_jump = 0.0
+    for c in numeric_cols:
+        v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+        v = v[~np.isnan(v)]
+        if v.size < 3:
+            continue
+        du = np.diff(v)
+        jump = np.nanmax(np.abs(du))
+        if np.isfinite(jump) and jump > best_jump:
+            best_jump = float(jump)
+            best_col = c
+    return best_col
+
 def select_mv_column(df: pd.DataFrame, time_col: str, pv_col: str) -> str:
     candidates = [
         "Heater Output",
@@ -112,6 +128,9 @@ def select_mv_column(df: pd.DataFrame, time_col: str, pv_col: str) -> str:
     for c in candidates:
         if c in df.columns:
             return c
+    auto = auto_mv_by_biggest_step(df, exclude=[time_col, pv_col])
+    if auto is not None:
+        return auto
     numeric_cols = [c for c in df.columns if c not in (time_col, pv_col) and pd.api.types.is_numeric_dtype(df[c])]
     if numeric_cols:
         return numeric_cols[0]
@@ -197,7 +216,7 @@ def make_workflow_from_fopdt(trial_name: str, fluid: str, fopdt: Optional[Dict[s
     if fopdt:
         items.append(WorkflowItem(step="FOPDT estimation", detail=f"K={fopdt['K']:.3f}, tau={fopdt['tau']:.2f}s, theta={fopdt['theta']:.2f}s"))
     else:
-        items.append(WorkflowItem(step="FOPDT estimation", detail="FOPDT not reliably detected or data not numeric"))
+        items.append(WorkflowItem(step="FOPDT estimation", detail="FOPDT not reliably detected"))
     items.append(WorkflowItem(step="Tuning method", detail=method))
     items.append(WorkflowItem(step="Lab constraints", detail="Small-scale PCT with dead time and heat exchanger"))
     return items
@@ -268,14 +287,17 @@ def analyze_trial_excel(
     fluid: str,
     mode: str,
     prior_pid: Optional[Dict[str, float]] = None,
-    objective: str = "Minimize overshoot and settling time while rejecting ice-pack disturbance"
+    objective: str = "Minimize overshoot and settling time while rejecting ice-pack disturbance",
+    time_col: Optional[str] = None,
+    pv_col: Optional[str] = None,
+    mv_col: Optional[str] = None,
 ) -> TrialAnalysisResult:
     df = read_excel_file(file_bytes)
     df = clean_export_df(df)
-    time_col = select_time_column(df)
-    pv_col = select_pv_column(df, time_col)
-    mv_col = select_mv_column(df, time_col, pv_col)
-    fopdt = estimate_fopdt_from_step(df, time_col, pv_col, mv_col)
+    auto_time = select_time_column(df) if time_col is None else time_col
+    auto_pv = select_pv_column(df, auto_time) if pv_col is None else pv_col
+    auto_mv = select_mv_column(df, auto_time, auto_pv) if mv_col is None else mv_col
+    fopdt = estimate_fopdt_from_step(df, auto_time, auto_pv, auto_mv)
     normalized_mode = normalize_mode(mode)
     if normalized_mode == "day1":
         if fopdt:
@@ -287,7 +309,7 @@ def analyze_trial_excel(
             workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=tuned, workflow=workflow)
         else:
-            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected or data non-numeric; using fallback PID")
+            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected; check selected columns or ensure a clear step in MV")
             workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, "Fallback", normalized_mode)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=default_pid, workflow=workflow)
     else:
