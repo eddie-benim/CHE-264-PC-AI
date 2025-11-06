@@ -3,11 +3,12 @@ import json
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Literal
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 if "OPENAI_API_KEY" in os.environ:
     _client = OpenAI()
@@ -42,56 +43,122 @@ def run_async_task(coro):
     return loop.run_until_complete(coro)
 
 def read_excel_file(file_bytes: bytes) -> pd.DataFrame:
-    return pd.read_excel(file_bytes)
+    bio = BytesIO(file_bytes)
+    try:
+        df = pd.read_excel(bio)
+        return df
+    except Exception:
+        bio.seek(0)
+        df = pd.read_excel(bio, engine="xlrd")
+        return df
+
+def clean_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if df.index.dtype == "O":
+        df = df.reset_index(drop=True)
+    return df
 
 def select_time_column(df: pd.DataFrame) -> str:
-    candidates = ["Elapsed Time", "elapsed_time", "Time", "time", "Sample Time", "sample_time"]
+    candidates = [
+        "Elapsed Time",
+        "elapsed_time",
+        "Time",
+        "time",
+        "Sample Time",
+        "sample_time",
+        "Seconds",
+        "seconds",
+    ]
     for c in candidates:
         if c in df.columns:
             return c
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        return numeric_cols[0]
     return df.columns[0]
 
-def select_pv_column(df: pd.DataFrame) -> str:
-    candidates = ["T2", "Temperature", "temperature", "PV", "Process Variable", "T1", "T4"]
+def select_pv_column(df: pd.DataFrame, time_col: str) -> str:
+    candidates = [
+        "T2",
+        "T1",
+        "Temperature",
+        "temperature",
+        "PV",
+        "Process Variable",
+        "Tank Temp",
+        "Hot Outlet Temp",
+    ]
     for c in candidates:
         if c in df.columns:
             return c
-    return df.columns[1]
+    numeric_cols = [c for c in df.columns if c != time_col and pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        return numeric_cols[0]
+    other_cols = [c for c in df.columns if c != time_col]
+    return other_cols[0]
 
-def select_mv_column(df: pd.DataFrame) -> str:
-    candidates = ["Heater Output", "Power", "power", "Controller Output", "MV", "N2", "Hot Water Pump", "Hot water pump speed"]
+def select_mv_column(df: pd.DataFrame, time_col: str, pv_col: str) -> str:
+    candidates = [
+        "Heater Output",
+        "Power",
+        "power",
+        "Controller Output",
+        "MV",
+        "Control Output",
+        "Hot Water Pump",
+        "Pump Output",
+    ]
     for c in candidates:
         if c in df.columns:
             return c
-    return df.columns[2]
+    numeric_cols = [c for c in df.columns if c not in (time_col, pv_col) and pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        return numeric_cols[0]
+    other_cols = [c for c in df.columns if c not in (time_col, pv_col)]
+    return other_cols[0]
+
+def coerce_numeric(series: pd.Series) -> np.ndarray:
+    s = pd.to_numeric(series, errors="coerce")
+    return s.to_numpy(dtype=float)
 
 def estimate_fopdt_from_step(df: pd.DataFrame, time_col: str, pv_col: str, mv_col: str) -> Optional[Dict[str, float]]:
-    t = df[time_col].to_numpy(dtype=float)
-    y = df[pv_col].to_numpy(dtype=float)
-    u = df[mv_col].to_numpy(dtype=float)
-    if len(t) < 10:
+    t_raw = df[time_col]
+    y_raw = df[pv_col]
+    u_raw = df[mv_col]
+    t = coerce_numeric(t_raw)
+    y = coerce_numeric(y_raw)
+    u = coerce_numeric(u_raw)
+    mask = ~np.isnan(t) & ~np.isnan(y) & ~np.isnan(u)
+    t = t[mask]
+    y = y[mask]
+    u = u[mask]
+    if t.size < 10 or y.size < 10 or u.size < 10:
         return None
     du = np.diff(u)
-    if len(du) == 0:
+    if du.size == 0:
         return None
-    step_idx = np.argmax(np.abs(du) > 0.25 * np.nanmax(np.abs(du)))
-    if np.abs(du[step_idx]) < 1e-6:
+    max_du = np.nanmax(np.abs(du))
+    if not np.isfinite(max_du) or max_du < 1e-6:
+        return None
+    step_idx = int(np.argmax(np.abs(du) > 0.25 * max_du))
+    if step_idx >= du.size:
         return None
     t_step = t[step_idx + 1]
     y0 = y[step_idx]
-    y_ss = np.nanmean(y[int(0.8 * len(y)) :])
+    y_ss = np.nanmean(y[int(0.8 * y.size) :])
     delta_y = y_ss - y0
     delta_u = u[step_idx + 1] - u[step_idx]
-    if np.abs(delta_y) < 1e-6 or np.abs(delta_u) < 1e-6:
+    if abs(delta_y) < 1e-6 or abs(delta_u) < 1e-6:
         return None
     y28 = y0 + 0.283 * delta_y
     y63 = y0 + 0.632 * delta_y
-    t28_candidates = t[(y >= y28)]
-    t63_candidates = t[(y >= y63)]
-    if len(t28_candidates) == 0 or len(t63_candidates) == 0:
+    t28_candidates = t[y >= y28]
+    t63_candidates = t[y >= y63]
+    if t28_candidates.size == 0 or t63_candidates.size == 0:
         return None
-    t28 = t28_candidates[0]
-    t63 = t63_candidates[0]
+    t28 = float(t28_candidates[0])
+    t63 = float(t63_candidates[0])
     theta = max(t28 - t_step, 1e-3)
     tau = max(t63 - t28, 1e-3)
     K = delta_y / delta_u
@@ -130,9 +197,9 @@ def make_workflow_from_fopdt(trial_name: str, fluid: str, fopdt: Optional[Dict[s
     if fopdt:
         items.append(WorkflowItem(step="FOPDT estimation", detail=f"K={fopdt['K']:.3f}, tau={fopdt['tau']:.2f}s, theta={fopdt['theta']:.2f}s"))
     else:
-        items.append(WorkflowItem(step="FOPDT estimation", detail="FOPDT not reliably detected, data may lack clear step"))
+        items.append(WorkflowItem(step="FOPDT estimation", detail="FOPDT not reliably detected or data not numeric"))
     items.append(WorkflowItem(step="Tuning method", detail=method))
-    items.append(WorkflowItem(step="Lab constraints", detail="Small-scale PCT with holding tube dead time and heat exchanger per manual"))
+    items.append(WorkflowItem(step="Lab constraints", detail="Small-scale PCT with dead time and heat exchanger"))
     return items
 
 def preview_df(df: pd.DataFrame, n: int = 40) -> List[Dict[str, Any]]:
@@ -191,7 +258,7 @@ def normalize_mode(mode: str) -> Literal["day1", "day2"]:
     m = mode.strip().lower()
     if m in ["day1", "zn", "ziegler-nichols", "ziegler", "traditional"]:
         return "day1"
-    if m in ["day2", "ml", "machine-learning", "ai"]:
+    if m in ["day2", "ml", "machine-learning", "ai", "agent"]:
         return "day2"
     return "day1"
 
@@ -204,9 +271,10 @@ def analyze_trial_excel(
     objective: str = "Minimize overshoot and settling time while rejecting ice-pack disturbance"
 ) -> TrialAnalysisResult:
     df = read_excel_file(file_bytes)
+    df = clean_export_df(df)
     time_col = select_time_column(df)
-    pv_col = select_pv_column(df)
-    mv_col = select_mv_column(df)
+    pv_col = select_pv_column(df, time_col)
+    mv_col = select_mv_column(df, time_col, pv_col)
     fopdt = estimate_fopdt_from_step(df, time_col, pv_col, mv_col)
     normalized_mode = normalize_mode(mode)
     if normalized_mode == "day1":
@@ -219,7 +287,7 @@ def analyze_trial_excel(
             workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, tuned.method, normalized_mode)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=tuned, workflow=workflow)
         else:
-            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected; using fallback")
+            default_pid = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="FOPDT not detected or data non-numeric; using fallback PID")
             workflow = make_workflow_from_fopdt(trial_name, fluid, fopdt, "Fallback", normalized_mode)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized_mode, suggested_pid=default_pid, workflow=workflow)
     else:
