@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Literal
 
@@ -7,9 +8,11 @@ import numpy as np
 import pandas as pd
 from openai import OpenAI
 from pydantic import BaseModel, Field
-from agents import Agent, Runner, RunContextWrapper, TResponseInputItem, input_guardrail, GuardrailFunctionOutput
 
-_client = OpenAI()
+if "OPENAI_API_KEY" in os.environ:
+    _client = OpenAI()
+else:
+    _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
 class PIDTuningResult(BaseModel):
     kp: float
@@ -29,60 +32,14 @@ class TrialAnalysisResult(BaseModel):
     suggested_pid: PIDTuningResult
     workflow: List[WorkflowItem]
 
-class MLTrialInput(BaseModel):
-    trial_name: str
-    fluid: str
-    prior_pid: Optional[Dict[str, float]] = None
-    fopdt: Optional[Dict[str, float]] = None
-    data_preview: List[Dict[str, Any]]
-    objective: str
-
-class MLPIDOutput(BaseModel):
-    kp: float = Field(..., description="Proportional gain")
-    ti: float = Field(..., description="Integral time in seconds")
-    td: float = Field(..., description="Derivative time in seconds")
-    rationale: str = Field(..., description="Short rationale tied to observed data and process traits")
-
-ml_pid_agent = Agent(
-    name="Process Control PID ML Agent",
-    instructions="""
-You are assisting with tuning PID parameters for a small laboratory-scale process plant trainer used to control temperatures and flows. The plant has two pumps, a heating tank, a plate heat exchanger, a holding tube that introduces noticeable dead time, and several temperature sensors. Fluid pairs can be water-water or mineral-oil–water. Oil-water runs tend to have higher heat capacity on the hot side and slower approach to steady state. The controller goal is fast disturbance rejection with limited overshoot. Prefer conservative gains if dead time is significant.
-You receive: (1) brief trial metadata, (2) optional prior PID values, (3) data-derived FOPDT estimates, and (4) preview rows of the uploaded Excel data. You must return tuned PID values that the lab group can type directly into the PCT software. If the fluid is mineral-oil–water and the prior PID was from water-water, reduce Kp (proportional gain) relative to the water-water values and lengthen Ti slightly to avoid oscillations caused by slower dynamics. Use the FOPDT estimate as an anchor but you may deviate from Ziegler–Nichols for better robustness. Output JSON only.
-""",
-    output_type=MLPIDOutput,
-    model="gpt-4o",
-)
-
-class OutOfScopeCheck(BaseModel):
-    is_off_topic: bool
-    explanation: str
-
-scope_guard_agent = Agent(
-    name="Scope Guard",
-    instructions="Allow only process-control-lab-related tuning tasks. Reject philosophical or unrelated topics.",
-    output_type=OutOfScopeCheck,
-    model="gpt-4o",
-)
-
-@input_guardrail
-async def process_control_scope_guardrail(
-    ctx: RunContextWrapper[None],
-    agent: Agent,
-    input: str | List[TResponseInputItem],
-) -> GuardrailFunctionOutput:
-    out = await Runner.run(scope_guard_agent, input, context=ctx.context)
-    return GuardrailFunctionOutput(
-        output_info=out.final_output,
-        tripwire_triggered=out.final_output.is_off_topic,
-    )
-
-def run_async_task(task):
+def run_async_task(coro):
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    return loop.run_until_complete(task)
+        loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
 
 def read_excel_file(file_bytes: bytes) -> pd.DataFrame:
     return pd.read_excel(file_bytes)
@@ -181,23 +138,53 @@ def make_workflow_from_fopdt(trial_name: str, fluid: str, fopdt: Optional[Dict[s
 def preview_df(df: pd.DataFrame, n: int = 40) -> List[Dict[str, Any]]:
     return df.head(n).to_dict(orient="records")
 
-def ml_tune_pid(trial_name: str, fluid: str, df: pd.DataFrame, fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
-    payload = MLTrialInput(
-        trial_name=trial_name,
-        fluid=fluid,
-        prior_pid=prior_pid,
-        fopdt=fopdt,
-        data_preview=preview_df(df),
-        objective=objective,
+def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
+    system_msg = (
+        "You are assisting with tuning PID parameters for a small process-control teaching plant. "
+        "You will receive JSON with trial_name, fluid, optional prior_pid, optional FOPDT estimate, "
+        "and a preview of time-series data. Return JSON with keys kp, ti, td, rationale. "
+        "If fluid indicates mineral-oil–water and prior PID was for water, reduce kp and increase ti slightly. "
+        "If FOPDT dead time is large (theta/tau > 0.3), keep gains conservative."
     )
-    result = run_async_task(Runner.run(ml_pid_agent, payload.model_dump()))
-    out = result.final_output
+    user_msg = json.dumps(payload)
+    resp = _client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.2,
+    )
+    content = resp.choices[0].message.content.strip()
+    if content.startswith("```"):
+        content = content.strip("`")
+        content = content.replace("json", "").strip()
+    try:
+        data = json.loads(content)
+    except Exception:
+        data = {"kp": 1.0, "ti": 30.0, "td": 0.0, "rationale": "LLM output not JSON, fallback PID used."}
+    return data
+
+def ml_tune_pid(trial_name: str, fluid: str, df: pd.DataFrame, fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
+    payload = {
+        "trial_name": trial_name,
+        "fluid": fluid,
+        "prior_pid": prior_pid,
+        "fopdt": fopdt,
+        "data_preview": preview_df(df),
+        "objective": objective,
+    }
+    out = call_openai_for_pid(payload)
+    kp = float(out.get("kp", 1.0))
+    ti = float(out.get("ti", 30.0))
+    td = float(out.get("td", 0.0))
+    rationale = out.get("rationale", "No rationale provided")
     return PIDTuningResult(
-        kp=float(out.kp),
-        ti=float(out.ti),
-        td=float(out.td),
-        method="ML-tuned via OpenAI agent",
-        notes=out.rationale,
+        kp=kp,
+        ti=ti,
+        td=td,
+        method="ML-tuned via OpenAI chat",
+        notes=rationale,
     )
 
 def normalize_mode(mode: str) -> Literal["day1", "day2"]:
