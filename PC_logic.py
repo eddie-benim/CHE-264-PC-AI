@@ -37,6 +37,19 @@ ELAPSED_IDX = 3
 MV_IDX = 7
 PV_IDX = 9
 
+Kp_MIN = 0.005
+Kp_MAX = 0.5
+Ti_MIN = 60.0
+Ti_MAX = 1200.0
+Td_MIN = 0.0
+Td_MAX = 120.0
+
+def clamp_pid(pid: PIDTuningResult) -> PIDTuningResult:
+    kp = max(Kp_MIN, min(pid.kp, Kp_MAX))
+    ti = max(Ti_MIN, min(pid.ti, Ti_MAX))
+    td = max(Td_MIN, min(pid.td, Td_MAX))
+    return PIDTuningResult(kp=kp, ti=ti, td=td, method=pid.method, notes=pid.notes)
+
 def read_excel_file(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
     try:
@@ -150,19 +163,28 @@ def ziegler_nichols_pid(fopdt: Dict[str, float]) -> PIDTuningResult:
     return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="Ziegler-Nichols (open-loop)", notes="Based on exported PCT data")
 
 def conservative_from_zn(zn: PIDTuningResult, factor: float = 0.7) -> PIDTuningResult:
-    return PIDTuningResult(
-        kp=float(zn.kp * factor),
-        ti=float(zn.ti * 1.2),
-        td=float(zn.td),
-        method="Conservative ZN",
-        notes="Adjusted due to expected property change/mineral oil",
-    )
+    kp = zn.kp * factor
+    ti = zn.ti * 1.2
+    td = zn.td
+    return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="Conservative ZN", notes="Adjusted due to expected property change/mineral oil")
+
+def json_safe(obj: Any) -> Any:
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.isoformat()
+    return obj
 
 def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
+    safe_payload = json.loads(json.dumps(payload, default=json_safe))
     system_msg = "You are assisting with tuning PID parameters for a small process control experiment. Return JSON with kp, ti, td, rationale."
     resp = _client.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": json.dumps(payload)}],
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": json.dumps(safe_payload)}],
         temperature=0.2,
     )
     content = resp.choices[0].message.content.strip()
@@ -183,13 +205,14 @@ def ml_tune_pid(trial_name: str, fluid: str, df: pd.DataFrame, fopdt: Optional[D
         "data_preview": df.head(40).to_dict(orient="records"),
     }
     out = call_openai_for_pid(payload)
-    return PIDTuningResult(
+    pid = PIDTuningResult(
         kp=float(out.get("kp", 1.0)),
         ti=float(out.get("ti", 30.0)),
         td=float(out.get("td", 0.0)),
         method="ML-tuned via OpenAI chat",
         notes=out.get("rationale", "No rationale provided"),
     )
+    return clamp_pid(pid)
 
 def normalize_mode(mode: str) -> Literal["day1", "day2"]:
     m = mode.strip().lower()
@@ -236,10 +259,11 @@ def analyze_trial_excel(
                 tuned = conservative_from_zn(zn, factor=0.6)
             else:
                 tuned = zn
+            tuned = clamp_pid(tuned)
             wf = make_workflow(trial_name, fluid, normalized, source, fopdt, tuned.method)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=tuned, workflow=wf)
         else:
-            fb = PIDTuningResult(kp=1.0, ti=30.0, td=0.0, method="Fallback", notes="Could not infer dynamics: Elapsed Time, Heater Power, or T2 had no usable change")
+            fb = PIDTuningResult(kp=0.05, ti=300.0, td=0.0, method="Fallback", notes="Could not infer dynamics: Elapsed Time, Heater Power, or T2 had no usable change")
             wf = make_workflow(trial_name, fluid, normalized, source, None, "Fallback")
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=fb, workflow=wf)
     else:
