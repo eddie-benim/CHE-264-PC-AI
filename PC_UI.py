@@ -1,8 +1,6 @@
 import os
 from datetime import datetime
-from io import BytesIO
 
-import pandas as pd
 import streamlit as st
 import PC_logic as pcl
 
@@ -23,7 +21,7 @@ with st.sidebar:
     st.markdown(f"**Time:** {ts['time']}")
     st.markdown(f"**Day:** {ts['day_of_week']}")
     mode_label = st.radio(
-        "Tuning Mode",
+        "Tuning mode",
         ["Day 1 – Ziegler–Nichols", "Day 2 – ML / data-driven"],
         index=0,
     )
@@ -39,7 +37,7 @@ with st.sidebar:
         height=80,
     )
     if mode_value == "day2":
-        st.markdown("#### Optional prior PID (for refinement)")
+        st.markdown("#### Optional prior PID")
         prior_kp = st.number_input("Prior Kp", value=0.0, min_value=0.0, step=0.1)
         prior_ti = st.number_input("Prior Ti (s)", value=0.0, min_value=0.0, step=0.5)
         prior_td = st.number_input("Prior Td (s)", value=0.0, min_value=0.0, step=0.1)
@@ -47,34 +45,13 @@ with st.sidebar:
         prior_kp = prior_ti = prior_td = 0.0
 
 st.divider()
+
 st.subheader("Upload trial data")
 uploaded_file = st.file_uploader(
-    "Drag and drop or browse to an Excel export (.xlsx, .xls)",
+    "Attach Excel export (.xlsx or .xls) from the process control software",
     type=["xlsx", "xls"],
 )
-
 trial_name = st.text_input("Trial label", value="Current_Trial")
-
-time_col = None
-pv_col = None
-mv_col = None
-
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    bio = BytesIO(file_bytes)
-    try:
-        df_preview = pd.read_excel(bio)
-    except Exception:
-        bio.seek(0)
-        df_preview = pd.read_excel(bio, engine="xlrd")
-    cols = list(df_preview.columns)
-    st.markdown("**Detected columns from file:**")
-    st.code("\n".join(str(c) for c in cols), language="text")
-    time_col = st.selectbox("Select time column", cols, index=0)
-    pv_col = st.selectbox("Select PV (temperature/process variable) column", cols, index=min(1, len(cols)-1))
-    mv_col = st.selectbox("Select MV (controller/manipulated) column", cols, index=min(2, len(cols)-1))
-else:
-    df_preview = None
 
 run_btn = st.button("Generate PID", use_container_width=True)
 
@@ -95,9 +72,6 @@ if run_btn:
                 mode=mode_value,
                 prior_pid=prior_pid,
                 objective=objective,
-                time_col=time_col,
-                pv_col=pv_col,
-                mv_col=mv_col,
             )
         st.session_state.runs.append(result)
 
@@ -105,7 +79,7 @@ st.divider()
 st.subheader("Results")
 
 if not st.session_state.runs:
-    st.info("Run an analysis to see PID suggestions here.")
+    st.info("Upload a file and run analysis to see PID suggestions here.")
 else:
     for r in reversed(st.session_state.runs):
         with st.expander(f"{r.trial_name} – {r.fluid} – {r.mode.upper()}"):
