@@ -1,0 +1,28 @@
+# === Core Streamlit app ===
+streamlit>=1.37.0
+
+# === Data analysis and numerical operations ===
+pandas>=2.2.2
+numpy>=1.26.0
+openpyxl>=3.1.2  # for reading Excel uploads
+
+# === OpenAI SDK (modern client) ===
+openai>=1.30.0
+
+# === Data models and validation ===
+pydantic>=2.6.1
+
+# === Async support and event loop handling ===
+aiohttp>=3.9.5
+
+# === Time, date, and system utilities ===
+python-dateutil>=2.9.0
+
+# === Optional: for robustness in environments with Excel I/O ===
+xlrd>=2.0.1
+
+# === (Optional) Plotting, in case you later add visualizations ===
+matplotlib>=3.8.0
+
+# === (Optional) For JSON and schema handling (already standard library, but safe) ===
+orjson>=3.10.0
