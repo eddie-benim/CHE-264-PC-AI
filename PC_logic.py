@@ -168,23 +168,69 @@ def conservative_from_zn(zn: PIDTuningResult, factor: float = 0.7) -> PIDTuningR
     td = zn.td
     return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="Conservative ZN", notes="Adjusted due to expected property change/mineral oil")
 
-def json_safe(obj: Any) -> Any:
-    if isinstance(obj, (np.floating,)):
+def to_json_safe(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, (str, bool)):
+        return obj
+    if isinstance(obj, (int,)):
+        return int(obj)
+    if isinstance(obj, (float,)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
         return float(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        if np.isnan(v) or np.isinf(v):
+            return None
+        return v
     if isinstance(obj, (np.ndarray,)):
-        return obj.tolist()
+        return [to_json_safe(x) for x in obj.tolist()]
+    if isinstance(obj, (list, tuple)):
+        return [to_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): to_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (pd.Timestamp,)):
         return obj.isoformat()
-    return obj
+    return str(obj)
+
+def compact_preview(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], n: int = 60) -> Dict[str, List[Optional[float]]]:
+    def clip_clean(arr):
+        if arr is None:
+            return None
+        a = arr[:n]
+        out = []
+        for v in a:
+            if v is None:
+                out.append(None)
+            elif isinstance(v, (float, np.floating)):
+                if np.isnan(v) or np.isinf(v):
+                    out.append(None)
+                else:
+                    out.append(float(v))
+            elif isinstance(v, (int, np.integer)):
+                out.append(int(v))
+            else:
+                try:
+                    fv = float(v)
+                    if np.isnan(fv) or np.isinf(fv):
+                        out.append(None)
+                    else:
+                        out.append(fv)
+                except:
+                    out.append(None)
+        return out
+    return {"t": clip_clean(t), "y": clip_clean(y), "u": clip_clean(u) if u is not None else None}
 
 def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
-    safe_payload = json.loads(json.dumps(payload, default=json_safe))
+    safe_payload = to_json_safe(payload)
+    user_content = json.dumps(safe_payload, allow_nan=False)
     system_msg = "You are assisting with tuning PID parameters for a small process control experiment. Return JSON with kp, ti, td, rationale."
     resp = _client.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": json.dumps(safe_payload)}],
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_content}],
         temperature=0.2,
     )
     content = resp.choices[0].message.content.strip()
@@ -195,14 +241,14 @@ def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"kp": 1.0, "ti": 30.0, "td": 0.0, "rationale": "LLM output not JSON; fallback used."}
 
-def ml_tune_pid(trial_name: str, fluid: str, df: pd.DataFrame, fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
+def ml_tune_pid(trial_name: str, fluid: str, t: np.ndarray, y: np.ndarray, u: np.ndarray, fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
     payload = {
         "trial_name": trial_name,
         "fluid": fluid,
         "fopdt": fopdt,
         "prior_pid": prior_pid,
         "objective": objective,
-        "data_preview": df.head(40).to_dict(orient="records"),
+        "data_preview": compact_preview(t, y, u, n=120),
     }
     out = call_openai_for_pid(payload)
     pid = PIDTuningResult(
@@ -267,7 +313,7 @@ def analyze_trial_excel(
             wf = make_workflow(trial_name, fluid, normalized, source, None, "Fallback")
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=fb, workflow=wf)
     else:
-        tuned = ml_tune_pid(trial_name, fluid, df, fopdt, prior_pid, objective)
+        tuned = ml_tune_pid(trial_name, fluid, t, y, u, fopdt, prior_pid, objective)
         wf = make_workflow(trial_name, fluid, normalized, source, fopdt, tuned.method)
         wf.append(WorkflowItem(step="ML rationale", detail=tuned.notes))
         return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=tuned, workflow=wf)
