@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Tuple
 from io import BytesIO
 
 import numpy as np
@@ -43,6 +43,10 @@ Ti_MIN = 60.0
 Ti_MAX = 1200.0
 Td_MIN = 0.0
 Td_MAX = 120.0
+
+TEMP_KEYS = ["temp", "°c", "deg c", "deg  c", "deg  c", "t2", "t_2", "hot water", "hw", "temperature"]
+MV_KEYS = ["power", "pwr", "heater", "heat", "pump", "valve", "duty", "mv", "u", "speed", "kw", "%"]
+TIME_KEYS = ["elapsed", "time", "timestamp", "t(s)", "t (s)", "t [s]", "seconds", "sec"]
 
 def clamp_pid(pid: PIDTuningResult) -> PIDTuningResult:
     kp = max(Kp_MIN, min(pid.kp, Kp_MAX))
@@ -196,7 +200,7 @@ def to_json_safe(obj: Any) -> Any:
         return obj.isoformat()
     return str(obj)
 
-def compact_preview(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], n: int = 60) -> Dict[str, List[Optional[float]]]:
+def compact_preview(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], n: int = 120) -> Dict[str, List[Optional[float]]]:
     def clip_clean(arr):
         if arr is None:
             return None
@@ -241,14 +245,20 @@ def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"kp": 1.0, "ti": 30.0, "td": 0.0, "rationale": "LLM output not JSON; fallback used."}
 
-def ml_tune_pid(trial_name: str, fluid: str, t: np.ndarray, y: np.ndarray, u: np.ndarray, fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
+def ml_tune_pid(trial_name: str, fluid: str, t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
     payload = {
         "trial_name": trial_name,
         "fluid": fluid,
         "fopdt": fopdt,
-        "prior_pid": prior_pid,
+        "prior_pid": to_json_safe(prior_pid),
         "objective": objective,
-        "data_preview": compact_preview(t, y, u, n=120),
+        "data_preview": compact_preview(t, y, u, n=180),
+        "features": {
+            "t_span": float(np.nanmax(t) - np.nanmin(t)) if t.size else 0.0,
+            "y_range": float(np.nanmax(y) - np.nanmin(y)) if y.size else 0.0,
+            "u_range": float(np.nanmax(u) - np.nanmin(u)) if (u is not None and u.size) else None,
+            "y_slope_med": float(np.nanmedian(np.diff(y))) if y.size > 1 else 0.0,
+        },
     }
     out = call_openai_for_pid(payload)
     pid = PIDTuningResult(
@@ -265,6 +275,73 @@ def normalize_mode(mode: str) -> Literal["day1", "day2"]:
     if "day2" in m or "ml" in m:
         return "day2"
     return "day1"
+
+def monotonic_score(x: np.ndarray) -> float:
+    if x.size < 3:
+        return 0.0
+    dx = np.diff(x)
+    pos = np.sum(dx >= 0)
+    neg = np.sum(dx <= 0)
+    return float(max(pos, neg) / dx.size)
+
+def keyword_score(name: str, keys: List[str]) -> int:
+    n = name.lower()
+    return sum(1 for k in keys if k in n)
+
+def lowfreq_variance(x: np.ndarray) -> float:
+    if x.size < 5:
+        return 0.0
+    k = min(31, x.size // 5 * 2 + 1)
+    if k < 5:
+        return float(np.nanvar(x))
+    from numpy.lib.stride_tricks import sliding_window_view
+    try:
+        w = sliding_window_view(x, k).mean(axis=1)
+        return float(np.nanvar(w))
+    except Exception:
+        return float(np.nanvar(x))
+
+def detect_columns_generic(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
+    cols = list(df.columns)
+    candidates = []
+    for c in cols:
+        s = df[c]
+        v = coerce_numeric(s)
+        num_ratio = np.sum(~np.isnan(v)) / max(1, len(v))
+        score = 0.0
+        ks = keyword_score(c, TIME_KEYS)
+        if ks:
+            score += 3 * ks
+        score += 2.0 * monotonic_score(v)
+        if num_ratio > 0.9:
+            score += 0.5
+        candidates.append((score, c))
+    candidates.sort(reverse=True)
+    time_col = candidates[0][1] if candidates else cols[0]
+    pv_candidates = []
+    for c in cols:
+        if c == time_col:
+            continue
+        v = coerce_numeric(df[c])
+        score = 0.0
+        score += 2.0 * keyword_score(c, TEMP_KEYS)
+        score += 1.0 * lowfreq_variance(v)
+        pv_candidates.append((score, c))
+    pv_candidates.sort(reverse=True)
+    pv_col = pv_candidates[0][1] if pv_candidates else (cols[1] if len(cols) > 1 else cols[0])
+    mv_candidates = []
+    for c in cols:
+        if c in (time_col, pv_col):
+            continue
+        v = coerce_numeric(df[c])
+        dv = np.diff(v)
+        score = 0.0
+        score += 2.0 * keyword_score(c, MV_KEYS)
+        score += 1.5 * float(np.nanmax(np.abs(dv)) if dv.size else 0.0)
+        mv_candidates.append((score, c))
+    mv_candidates.sort(reverse=True)
+    mv_col = mv_candidates[0][1] if mv_candidates else None
+    return time_col, pv_col, mv_col
 
 def make_workflow(trial: str, fluid: str, mode: str, source: str, fopdt: Optional[Dict[str, float]], method: str) -> List[WorkflowItem]:
     items = [WorkflowItem(step="Trial identified", detail=f"{trial}, fluid={fluid}, mode={mode}")]
@@ -286,18 +363,23 @@ def analyze_trial_excel(
 ) -> TrialAnalysisResult:
     df = read_excel_file(file_bytes)
     df = clean_export_df(df)
-    t_raw = get_col_by_index(df, ELAPSED_IDX)
-    mv_raw = get_col_by_index(df, MV_IDX)
-    pv_raw = get_col_by_index(df, PV_IDX)
+    normalized = normalize_mode(mode)
+    if normalized == "day1":
+        t_raw = get_col_by_index(df, ELAPSED_IDX)
+        mv_raw = get_col_by_index(df, MV_IDX)
+        pv_raw = get_col_by_index(df, PV_IDX)
+    else:
+        time_col, pv_col, mv_col = detect_columns_generic(df)
+        t_raw = df[time_col]
+        pv_raw = df[pv_col]
+        mv_raw = df[mv_col] if mv_col is not None else pd.Series([np.nan] * len(df))
     t = parse_elapsed_to_seconds(t_raw)
     y = coerce_numeric(pv_raw)
-    u = coerce_numeric(mv_raw)
-    fopdt = estimate_fopdt_mv_pv(t, y, u)
-    source = "MV+PV"
+    u = coerce_numeric(mv_raw) if mv_raw is not None else np.full_like(y, np.nan)
+    fopdt = estimate_fopdt_mv_pv(t, y, u) if np.any(np.isfinite(u)) else None
+    source = "MV+PV" if fopdt is not None else "PV-only"
     if fopdt is None:
         fopdt = estimate_fopdt_pv_only(t, y)
-        source = "PV-only"
-    normalized = normalize_mode(mode)
     if normalized == "day1":
         if fopdt:
             zn = ziegler_nichols_pid(fopdt)
@@ -309,11 +391,11 @@ def analyze_trial_excel(
             wf = make_workflow(trial_name, fluid, normalized, source, fopdt, tuned.method)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=tuned, workflow=wf)
         else:
-            fb = PIDTuningResult(kp=0.05, ti=300.0, td=0.0, method="Fallback", notes="Could not infer dynamics: Elapsed Time, Heater Power, or T2 had no usable change")
+            fb = PIDTuningResult(kp=0.05, ti=300.0, td=0.0, method="Fallback", notes="Could not infer dynamics from data")
             wf = make_workflow(trial_name, fluid, normalized, source, None, "Fallback")
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=fb, workflow=wf)
     else:
-        tuned = ml_tune_pid(trial_name, fluid, t, y, u, fopdt, prior_pid, objective)
+        tuned = ml_tune_pid(trial_name, fluid, t, y, u if np.any(np.isfinite(u)) else None, fopdt, prior_pid, objective)
         wf = make_workflow(trial_name, fluid, normalized, source, fopdt, tuned.method)
         wf.append(WorkflowItem(step="ML rationale", detail=tuned.notes))
         return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=tuned, workflow=wf)
