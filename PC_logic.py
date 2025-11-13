@@ -40,13 +40,13 @@ PV_IDX = 9
 Kp_MIN = 0.005
 Kp_MAX = 0.5
 Ti_MIN = 60.0
-Ti_MAX = 1200.0
+Ti_MAX = 7200.0
 Td_MIN = 0.0
-Td_MAX = 120.0
+Td_MAX = 600.0
 
-TEMP_KEYS = ["temp", "°c", "deg c", "deg  c", "deg  c", "t2", "t_2", "hot water", "hw", "temperature"]
+TEMP_KEYS = ["temp", "°c", "deg c", "t2", "hot water", "temperature"]
 MV_KEYS = ["power", "pwr", "heater", "heat", "pump", "valve", "duty", "mv", "u", "speed", "kw", "%"]
-TIME_KEYS = ["elapsed", "time", "timestamp", "t(s)", "t (s)", "t [s]", "seconds", "sec"]
+TIME_KEYS = ["elapsed", "time", "timestamp", "t(s)", "t (s)", "t [s]", "seconds", "sec", "date"]
 
 def clamp_pid(pid: PIDTuningResult) -> PIDTuningResult:
     kp = max(Kp_MIN, min(pid.kp, Kp_MAX))
@@ -64,7 +64,9 @@ def read_excel_file(file_bytes: bytes) -> pd.DataFrame:
 
 def clean_export_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all")
     return df.reset_index(drop=True)
 
 def get_col_by_index(df: pd.DataFrame, idx: int) -> pd.Series:
@@ -73,13 +75,24 @@ def get_col_by_index(df: pd.DataFrame, idx: int) -> pd.Series:
     return df.iloc[:, -1]
 
 def parse_elapsed_to_seconds(series: pd.Series) -> np.ndarray:
-    numeric = pd.to_numeric(series, errors="coerce")
-    if np.count_nonzero(~np.isnan(numeric.to_numpy())) > 0.6 * len(series):
-        return numeric.to_numpy(dtype=float)
+    s_num = pd.to_numeric(series, errors="coerce")
+    if np.isfinite(s_num.to_numpy()).sum() >= 0.6 * len(series):
+        arr = s_num.to_numpy(dtype=float)
+        if np.nanmax(arr) <= 2.0 and np.nanmax(arr) > 0.0:
+            arr = arr * 86400.0
+        return arr
+    try:
+        dt = pd.to_datetime(series, errors="coerce", utc=False, infer_datetime_format=True)
+        if dt.notna().sum() >= 0.6 * len(series):
+            base = dt.dropna().iloc[0]
+            secs = (dt - base).dt.total_seconds().to_numpy()
+            return secs
+    except Exception:
+        pass
     vals = series.astype(str).str.strip()
     out = []
     for v in vals:
-        if v == "" or v.lower() == "nan":
+        if not v or v.lower() == "nan":
             out.append(np.nan)
             continue
         parts = v.split(":")
@@ -91,7 +104,8 @@ def parse_elapsed_to_seconds(series: pd.Series) -> np.ndarray:
                 m = float(parts[0]); s = float(parts[1])
                 out.append(m * 60 + s)
             else:
-                out.append(float(v))
+                f = float(v)
+                out.append(f if np.isfinite(f) else np.nan)
         except Exception:
             out.append(np.nan)
     return np.array(out, dtype=float)
@@ -99,8 +113,56 @@ def parse_elapsed_to_seconds(series: pd.Series) -> np.ndarray:
 def coerce_numeric(series: pd.Series) -> np.ndarray:
     return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
 
+def enforce_monotonic_time(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    mask = np.isfinite(t) & np.isfinite(y)
+    if u is not None:
+        mask = mask & np.isfinite(u)
+    t = t[mask]; y = y[mask]; u = (u[mask] if u is not None else None)
+    order = np.argsort(t)
+    t = t[order]; y = y[order]; u = (u[order] if u is not None else None)
+    keep = np.concatenate(([True], np.diff(t) > 0))
+    t = t[keep]; y = y[keep]; u = (u[keep] if u is not None else None)
+    return t, y, u
+
+def smooth(x: np.ndarray, win: int = 21) -> np.ndarray:
+    x = x.copy()
+    n = len(x)
+    if n < 5:
+        return x
+    w = min(max(5, win), (n // 2) * 2 + 1)
+    half = w // 2
+    y = np.copy(x)
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n, i + half + 1)
+        y[i] = np.nanmean(x[a:b])
+    return y
+
+def longest_monotonic_segment(y: np.ndarray) -> Tuple[int, int, int]:
+    dy = np.diff(y)
+    if dy.size == 0:
+        return 0, len(y), 1
+    sign = np.sign(smooth(dy, 9))
+    sign[~np.isfinite(sign)] = 0
+    pos = sign >= 0
+    neg = sign <= 0
+    best = (0, 0, 1)
+    start = 0; cur = pos[0]
+    for i in range(1, len(sign)):
+        if (pos[i] if cur else neg[i]):
+            continue
+        end = i
+        if end - start > best[1] - best[0]:
+            best = (start, end + 1, 1 if cur else -1)
+        start = i
+        cur = pos[i]
+    end = len(sign)
+    if end - start > best[1] - best[0]:
+        best = (start, end + 1, 1 if cur else -1)
+    return best
+
 def estimate_fopdt_mv_pv(t: np.ndarray, y: np.ndarray, u: np.ndarray) -> Optional[Dict[str, float]]:
-    mask = ~np.isnan(t) & ~np.isnan(y) & ~np.isnan(u)
+    mask = np.isfinite(t) & np.isfinite(y) & np.isfinite(u)
     t = t[mask]; y = y[mask]; u = u[mask]
     if t.size < 10:
         return None
@@ -115,62 +177,79 @@ def estimate_fopdt_mv_pv(t: np.ndarray, y: np.ndarray, u: np.ndarray) -> Optiona
         return None
     t_step = t[step_idx + 1]
     y0 = y[step_idx]
-    y_ss = np.nanmean(y[int(0.8 * y.size):])
+    y_ss = np.nanmedian(y[int(0.9 * y.size):])
     dy = y_ss - y0
     du_val = u[step_idx + 1] - u[step_idx]
     if abs(dy) < 1e-6 or abs(du_val) < 1e-6:
         return None
     y28 = y0 + 0.283 * dy
     y63 = y0 + 0.632 * dy
-    t28_candidates = t[y >= y28]
-    t63_candidates = t[y >= y63]
-    if t28_candidates.size == 0 or t63_candidates.size == 0:
+    try:
+        t28 = float(t[np.where(y >= y28)[0][0]])
+        t63 = float(t[np.where(y >= y63)[0][0]])
+    except Exception:
         return None
-    t28 = float(t28_candidates[0])
-    t63 = float(t63_candidates[0])
     theta = max(t28 - t_step, 1e-3)
     tau = max(t63 - t28, 1e-3)
     K = dy / du_val
     return {"K": float(K), "tau": float(tau), "theta": float(theta)}
 
-def estimate_fopdt_pv_only(t: np.ndarray, y: np.ndarray) -> Optional[Dict[str, float]]:
-    mask = ~np.isnan(t) & ~np.isnan(y)
+def estimate_fopdt_pv_only_adaptive(t: np.ndarray, y: np.ndarray) -> Optional[Dict[str, float]]:
+    mask = np.isfinite(t) & np.isfinite(y)
     t = t[mask]; y = y[mask]
     if t.size < 10:
         return None
-    ymin = float(np.nanmin(y))
-    ymax = float(np.nanmax(y))
-    dy = ymax - ymin
-    if abs(dy) < 0.05:
+    y_s = smooth(y, 31)
+    a, b, direction = longest_monotonic_segment(y_s)
+    a = max(0, a - 2); b = min(len(y_s), b + 2)
+    t_seg = t[a:b]; y_seg = y_s[a:b]
+    if t_seg.size < 8:
         return None
-    t0 = float(t[np.argmin(y)])
-    y28 = ymin + 0.283 * dy
-    y63 = ymin + 0.632 * dy
-    t28_candidates = t[y >= y28]
-    t63_candidates = t[y >= y63]
-    if t28_candidates.size == 0 or t63_candidates.size == 0:
+    y0 = float(y_seg[0]); yend = float(np.nanmedian(y_seg[-max(3, t_seg.size // 10):]))
+    dy = yend - y0
+    if abs(dy) < 0.2:
         return None
-    t28 = float(t28_candidates[0])
-    t63 = float(t63_candidates[0])
-    theta = max(t28 - t0, 1e-3)
+    targ28 = y0 + 0.283 * dy
+    targ63 = y0 + 0.632 * dy
+    try:
+        t28 = float(t_seg[np.where((y_seg - y0) * np.sign(dy) >= (targ28 - y0) * np.sign(dy))[0][0]])
+    except Exception:
+        if direction > 0:
+            t28 = float(t_seg[min(len(t_seg) - 1, max(1, len(t_seg) // 5))])
+        else:
+            t28 = float(t_seg[min(len(t_seg) - 1, max(1, len(t_seg) // 5))])
+    try:
+        t63_idx = np.where((y_seg - y0) * np.sign(dy) >= (targ63 - y0) * np.sign(dy))[0]
+        if t63_idx.size == 0:
+            t63 = t_seg[-1]
+        else:
+            t63 = float(t_seg[t63_idx[0]])
+    except Exception:
+        t63 = t_seg[-1]
+    theta = max(t28 - t_seg[0], 1e-3)
     tau = max(t63 - t28, 1e-3)
-    K = dy
+    K = 1.0
     return {"K": float(K), "tau": float(tau), "theta": float(theta)}
 
-def ziegler_nichols_pid(fopdt: Dict[str, float]) -> PIDTuningResult:
+def zn_pid_from_fopdt(fopdt: Dict[str, float]) -> PIDTuningResult:
     K = fopdt["K"] if fopdt["K"] != 0 else 1.0
     tau = fopdt["tau"]
     theta = fopdt["theta"]
     kp = 1.2 * tau / (K * theta)
     ti = 2.0 * theta
     td = 0.5 * theta
-    return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="Ziegler-Nichols (open-loop)", notes="Based on exported PCT data")
+    return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="Ziegler-Nichols (open-loop)", notes="FOPDT-based ZN")
 
-def conservative_from_zn(zn: PIDTuningResult, factor: float = 0.7) -> PIDTuningResult:
-    kp = zn.kp * factor
-    ti = zn.ti * 1.2
-    td = zn.td
-    return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="Conservative ZN", notes="Adjusted due to expected property change/mineral oil")
+def imc_pid_from_fopdt(fopdt: Dict[str, float], lam: Optional[float] = None) -> PIDTuningResult:
+    K = fopdt.get("K", 1.0) if fopdt.get("K", 1.0) != 0 else 1.0
+    tau = fopdt["tau"]
+    theta = fopdt["theta"]
+    if lam is None:
+        lam = max(theta, 0.1 * tau)
+    kp = tau / (K * (lam + theta))
+    ti = tau
+    td = theta
+    return PIDTuningResult(kp=float(kp), ti=float(ti), td=float(td), method="IMC from FOPDT", notes=f"λ={lam:.2f}")
 
 def to_json_safe(obj: Any) -> Any:
     if obj is None:
@@ -200,7 +279,7 @@ def to_json_safe(obj: Any) -> Any:
         return obj.isoformat()
     return str(obj)
 
-def compact_preview(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], n: int = 120) -> Dict[str, List[Optional[float]]]:
+def compact_preview(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], n: int = 180) -> Dict[str, List[Optional[float]]]:
     def clip_clean(arr):
         if arr is None:
             return None
@@ -243,7 +322,7 @@ def call_openai_for_pid(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return json.loads(content)
     except Exception:
-        return {"kp": 1.0, "ti": 30.0, "td": 0.0, "rationale": "LLM output not JSON; fallback used."}
+        return {"kp": 0.05, "ti": 300.0, "td": 0.0, "rationale": "LLM output not JSON; fallback used."}
 
 def ml_tune_pid(trial_name: str, fluid: str, t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray], fopdt: Optional[Dict[str, float]], prior_pid: Optional[Dict[str, float]], objective: str) -> PIDTuningResult:
     payload = {
@@ -252,7 +331,7 @@ def ml_tune_pid(trial_name: str, fluid: str, t: np.ndarray, y: np.ndarray, u: Op
         "fopdt": fopdt,
         "prior_pid": to_json_safe(prior_pid),
         "objective": objective,
-        "data_preview": compact_preview(t, y, u, n=180),
+        "data_preview": compact_preview(t, y, u, n=240),
         "features": {
             "t_span": float(np.nanmax(t) - np.nanmin(t)) if t.size else 0.0,
             "y_range": float(np.nanmax(y) - np.nanmin(y)) if y.size else 0.0,
@@ -262,8 +341,8 @@ def ml_tune_pid(trial_name: str, fluid: str, t: np.ndarray, y: np.ndarray, u: Op
     }
     out = call_openai_for_pid(payload)
     pid = PIDTuningResult(
-        kp=float(out.get("kp", 1.0)),
-        ti=float(out.get("ti", 30.0)),
+        kp=float(out.get("kp", 0.05)),
+        ti=float(out.get("ti", 300.0)),
         td=float(out.get("td", 0.0)),
         method="ML-tuned via OpenAI chat",
         notes=out.get("rationale", "No rationale provided"),
@@ -275,14 +354,6 @@ def normalize_mode(mode: str) -> Literal["day1", "day2"]:
     if "day2" in m or "ml" in m:
         return "day2"
     return "day1"
-
-def monotonic_score(x: np.ndarray) -> float:
-    if x.size < 3:
-        return 0.0
-    dx = np.diff(x)
-    pos = np.sum(dx >= 0)
-    neg = np.sum(dx <= 0)
-    return float(max(pos, neg) / dx.size)
 
 def keyword_score(name: str, keys: List[str]) -> int:
     n = name.lower()
@@ -303,44 +374,33 @@ def lowfreq_variance(x: np.ndarray) -> float:
 
 def detect_columns_generic(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
     cols = list(df.columns)
-    candidates = []
+    t_scores = []
     for c in cols:
-        s = df[c]
-        v = coerce_numeric(s)
-        num_ratio = np.sum(~np.isnan(v)) / max(1, len(v))
-        score = 0.0
-        ks = keyword_score(c, TIME_KEYS)
-        if ks:
-            score += 3 * ks
-        score += 2.0 * monotonic_score(v)
-        if num_ratio > 0.9:
-            score += 0.5
-        candidates.append((score, c))
-    candidates.sort(reverse=True)
-    time_col = candidates[0][1] if candidates else cols[0]
-    pv_candidates = []
+        v = coerce_numeric(df[c])
+        num_ratio = np.sum(np.isfinite(v)) / max(1, len(v))
+        score = 2.0 * keyword_score(c, TIME_KEYS) + 1.0 * num_ratio
+        t_scores.append((score, c))
+    t_scores.sort(reverse=True)
+    time_col = t_scores[0][1] if t_scores else cols[0]
+    pv_scores = []
     for c in cols:
         if c == time_col:
             continue
         v = coerce_numeric(df[c])
-        score = 0.0
-        score += 2.0 * keyword_score(c, TEMP_KEYS)
-        score += 1.0 * lowfreq_variance(v)
-        pv_candidates.append((score, c))
-    pv_candidates.sort(reverse=True)
-    pv_col = pv_candidates[0][1] if pv_candidates else (cols[1] if len(cols) > 1 else cols[0])
-    mv_candidates = []
+        score = 2.0 * keyword_score(c, TEMP_KEYS) + 1.0 * lowfreq_variance(v)
+        pv_scores.append((score, c))
+    pv_scores.sort(reverse=True)
+    pv_col = pv_scores[0][1] if pv_scores else (cols[1] if len(cols) > 1 else cols[0])
+    mv_scores = []
     for c in cols:
         if c in (time_col, pv_col):
             continue
         v = coerce_numeric(df[c])
         dv = np.diff(v)
-        score = 0.0
-        score += 2.0 * keyword_score(c, MV_KEYS)
-        score += 1.5 * float(np.nanmax(np.abs(dv)) if dv.size else 0.0)
-        mv_candidates.append((score, c))
-    mv_candidates.sort(reverse=True)
-    mv_col = mv_candidates[0][1] if mv_candidates else None
+        score = 2.0 * keyword_score(c, MV_KEYS) + 1.5 * float(np.nanmax(np.abs(dv)) if dv.size else 0.0)
+        mv_scores.append((score, c))
+    mv_scores.sort(reverse=True)
+    mv_col = mv_scores[0][1] if mv_scores else None
     return time_col, pv_col, mv_col
 
 def make_workflow(trial: str, fluid: str, mode: str, source: str, fopdt: Optional[Dict[str, float]], method: str) -> List[WorkflowItem]:
@@ -376,17 +436,19 @@ def analyze_trial_excel(
     t = parse_elapsed_to_seconds(t_raw)
     y = coerce_numeric(pv_raw)
     u = coerce_numeric(mv_raw) if mv_raw is not None else np.full_like(y, np.nan)
-    fopdt = estimate_fopdt_mv_pv(t, y, u) if np.any(np.isfinite(u)) else None
+    t, y, u = enforce_monotonic_time(t, y, u if np.any(np.isfinite(u)) else None)
+    fopdt = estimate_fopdt_mv_pv(t, y, u) if u is not None and np.any(np.isfinite(u)) else None
     source = "MV+PV" if fopdt is not None else "PV-only"
     if fopdt is None:
-        fopdt = estimate_fopdt_pv_only(t, y)
+        fopdt = estimate_fopdt_pv_only_adaptive(t, y)
     if normalized == "day1":
         if fopdt:
-            zn = ziegler_nichols_pid(fopdt)
+            try:
+                tuned = zn_pid_from_fopdt(fopdt)
+            except Exception:
+                tuned = imc_pid_from_fopdt(fopdt)
             if fluid.lower().startswith("mineral"):
-                tuned = conservative_from_zn(zn, factor=0.6)
-            else:
-                tuned = zn
+                tuned = PIDTuningResult(kp=tuned.kp * 0.6, ti=tuned.ti * 1.2, td=tuned.td, method=tuned.method + " (conservative)", notes="Adjusted for property change")
             tuned = clamp_pid(tuned)
             wf = make_workflow(trial_name, fluid, normalized, source, fopdt, tuned.method)
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=tuned, workflow=wf)
@@ -395,7 +457,7 @@ def analyze_trial_excel(
             wf = make_workflow(trial_name, fluid, normalized, source, None, "Fallback")
             return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=fb, workflow=wf)
     else:
-        tuned = ml_tune_pid(trial_name, fluid, t, y, u if np.any(np.isfinite(u)) else None, fopdt, prior_pid, objective)
+        tuned = ml_tune_pid(trial_name, fluid, t, y, u if u is not None and np.any(np.isfinite(u)) else None, fopdt, prior_pid, objective)
         wf = make_workflow(trial_name, fluid, normalized, source, fopdt, tuned.method)
         wf.append(WorkflowItem(step="ML rationale", detail=tuned.notes))
         return TrialAnalysisResult(trial_name=trial_name, fluid=fluid, mode=normalized, suggested_pid=tuned, workflow=wf)
