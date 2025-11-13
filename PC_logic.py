@@ -117,11 +117,25 @@ def enforce_monotonic_time(t: np.ndarray, y: np.ndarray, u: Optional[np.ndarray]
     mask = np.isfinite(t) & np.isfinite(y)
     if u is not None:
         mask = mask & np.isfinite(u)
-    t = t[mask]; y = y[mask]; u = (u[mask] if u is not None else None)
+    t = t[mask]
+    y = y[mask]
+    u = u[mask] if u is not None else None
+    if t.size == 0:
+        return t, y, u
     order = np.argsort(t)
-    t = t[order]; y = y[order]; u = (u[order] if u is not None else None)
-    keep = np.concatenate(([True], np.diff(t) > 0))
-    t = t[keep]; y = y[keep]; u = (u[keep] if u is not None else None)
+    t = t[order]
+    y = y[order]
+    if u is not None:
+        u = u[order]
+    n = t.shape[0]
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = True
+    if n > 1:
+        keep[1:] = np.diff(t) > 0
+    t = t[keep]
+    y = y[keep]
+    if u is not None:
+        u = u[keep]
     return t, y, u
 
 def smooth(x: np.ndarray, win: int = 21) -> np.ndarray:
@@ -147,7 +161,8 @@ def longest_monotonic_segment(y: np.ndarray) -> Tuple[int, int, int]:
     pos = sign >= 0
     neg = sign <= 0
     best = (0, 0, 1)
-    start = 0; cur = pos[0]
+    start = 0
+    cur = pos[0]
     for i in range(1, len(sign)):
         if (pos[i] if cur else neg[i]):
             continue
@@ -163,7 +178,9 @@ def longest_monotonic_segment(y: np.ndarray) -> Tuple[int, int, int]:
 
 def estimate_fopdt_mv_pv(t: np.ndarray, y: np.ndarray, u: np.ndarray) -> Optional[Dict[str, float]]:
     mask = np.isfinite(t) & np.isfinite(y) & np.isfinite(u)
-    t = t[mask]; y = y[mask]; u = u[mask]
+    t = t[mask]
+    y = y[mask]
+    u = u[mask]
     if t.size < 10:
         return None
     du = np.diff(u)
@@ -196,16 +213,20 @@ def estimate_fopdt_mv_pv(t: np.ndarray, y: np.ndarray, u: np.ndarray) -> Optiona
 
 def estimate_fopdt_pv_only_adaptive(t: np.ndarray, y: np.ndarray) -> Optional[Dict[str, float]]:
     mask = np.isfinite(t) & np.isfinite(y)
-    t = t[mask]; y = y[mask]
+    t = t[mask]
+    y = y[mask]
     if t.size < 10:
         return None
     y_s = smooth(y, 31)
     a, b, direction = longest_monotonic_segment(y_s)
-    a = max(0, a - 2); b = min(len(y_s), b + 2)
-    t_seg = t[a:b]; y_seg = y_s[a:b]
+    a = max(0, a - 2)
+    b = min(len(y_s), b + 2)
+    t_seg = t[a:b]
+    y_seg = y_s[a:b]
     if t_seg.size < 8:
         return None
-    y0 = float(y_seg[0]); yend = float(np.nanmedian(y_seg[-max(3, t_seg.size // 10):]))
+    y0 = float(y_seg[0])
+    yend = float(np.nanmedian(y_seg[-max(3, t_seg.size // 10):]))
     dy = yend - y0
     if abs(dy) < 0.2:
         return None
@@ -214,10 +235,7 @@ def estimate_fopdt_pv_only_adaptive(t: np.ndarray, y: np.ndarray) -> Optional[Di
     try:
         t28 = float(t_seg[np.where((y_seg - y0) * np.sign(dy) >= (targ28 - y0) * np.sign(dy))[0][0]])
     except Exception:
-        if direction > 0:
-            t28 = float(t_seg[min(len(t_seg) - 1, max(1, len(t_seg) // 5))])
-        else:
-            t28 = float(t_seg[min(len(t_seg) - 1, max(1, len(t_seg) // 5))])
+        t28 = float(t_seg[min(len(t_seg) - 1, max(1, len(t_seg) // 5))])
     try:
         t63_idx = np.where((y_seg - y0) * np.sign(dy) >= (targ63 - y0) * np.sign(dy))[0]
         if t63_idx.size == 0:
@@ -436,7 +454,8 @@ def analyze_trial_excel(
     t = parse_elapsed_to_seconds(t_raw)
     y = coerce_numeric(pv_raw)
     u = coerce_numeric(mv_raw) if mv_raw is not None else np.full_like(y, np.nan)
-    t, y, u = enforce_monotonic_time(t, y, u if np.any(np.isfinite(u)) else None)
+    has_u = u is not None and np.any(np.isfinite(u))
+    t, y, u = enforce_monotonic_time(t, y, u if has_u else None)
     fopdt = estimate_fopdt_mv_pv(t, y, u) if u is not None and np.any(np.isfinite(u)) else None
     source = "MV+PV" if fopdt is not None else "PV-only"
     if fopdt is None:
